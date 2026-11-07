@@ -1,0 +1,236 @@
+# Builds the image from this fork and publishes it to ghcr.io/<owner>/arch-qbittorrentvpn.
+#
+# The upstream workflows (workflow-docker-*.yml) can't run on a fork: they call
+# binhex/templates, which needs binhex's Docker Hub, Quay and email secrets, and
+# they always build master and libtorrentv1. This one only needs GITHUB_TOKEN.
+#
+# Each architecture builds on a native runner and must pass a smoke test before
+# its image is pushed; the merge job then tags both digests as one multi-arch image.
+# There is no layer cache on purpose: install.sh installs qBittorrent from pacman
+# at build time, so a rebuild has to start clean to pick up newer packages.
+
+name: publish ghcr image
+
+on:
+  push:
+    branches:
+      - ghcr-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: qbittorrentvpn
+  # Shared by both jobs so the build labels and the pushed tags agree. The sha tag
+  # has the highest priority, which makes it the image version label and the
+  # release tag the container prints at startup.
+  IMAGE_TAGS: |
+    type=sha,priority=300
+    type=raw,value=latest
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: ${{ env.IMAGE_TAGS }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The push build below takes identical inputs, so it reuses every layer from
+      # this build's cache and the image it pushes is the one tested here.
+      - name: Build image for testing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ${{ env.APP_NAME }}:test
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APPNAME=${{ env.APP_NAME }}
+            RELEASETAG=${{ steps.meta.outputs.version }}
+
+      # The same check binhex/scripts testrunner.sh runs for qbittorrentvpn: start
+      # with the VPN disabled and wait for the WebUI to answer.
+      - name: Smoke test the WebUI
+        env:
+          IMAGE: ${{ env.APP_NAME }}:test
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke/config" "$RUNNER_TEMP/smoke/data"
+          docker run -d --name smoke --privileged \
+            -e VPN_ENABLED=no \
+            -v "$RUNNER_TEMP/smoke/config:/config" \
+            -v "$RUNNER_TEMP/smoke/data:/data" \
+            -p 127.0.0.1:9999:8080 \
+            "$IMAGE"
+          for second in $(seq 1 180); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9999/ || true)
+            if [[ "$code" =~ ^[234][0-9][0-9]$ ]]; then
+              echo "WebUI answered HTTP $code after ${second}s"
+              exit 0
+            fi
+            if [[ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]]; then
+              echo "::error::Container exited before the WebUI came up"
+              break
+            fi
+            sleep 1
+          done
+          echo "::error::WebUI did not answer on port 8080"
+          docker logs smoke || true
+          sudo cat "$RUNNER_TEMP/smoke/config/supervisord.log" || true
+          exit 1
+
+      - name: Record package versions
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          {
+            echo "### $ARCH"
+            echo '```'
+            docker exec smoke pacman -Q qbittorrent-nox libtorrent-rasterbar || true
+            docker exec smoke cat /etc/image-build-info || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APPNAME=${{ env.APP_NAME }}
+            RELEASETAG=${{ steps.meta.outputs.version }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish multi-arch tags
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags and annotations
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: ${{ env.IMAGE_TAGS }}
+
+      - name: Create and push the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then args+=(--tag "$tag"); fi
+          done <<< "$TAGS"
+          while IFS= read -r annotation; do
+            if [[ -n "$annotation" ]]; then args+=(--annotation "$annotation"); fi
+          done <<< "$ANNOTATIONS"
+          for digest in *; do
+            args+=("$IMAGE@sha256:$digest")
+          done
+          # GHCR can briefly fail to resolve digests that were only just pushed.
+          for attempt in 1 2 3; do
+            if docker buildx imagetools create "${args[@]}"; then
+              exit 0
+            fi
+            echo "::warning::imagetools create failed on attempt $attempt of 3"
+            sleep $((attempt * 20))
+          done
+          exit 1
+
+      - name: Inspect the published image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          {
+            echo '### Published tags'
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
